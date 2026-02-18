@@ -40,7 +40,7 @@ from mcp.client.streamable_http import streamablehttp_client
 import orjson
 from pydantic import ValidationError
 from sqlalchemy import and_, delete, desc, or_, select
-from sqlalchemy.exc import IntegrityError, OperationalError
+from sqlalchemy.exc import IntegrityError, InvalidRequestError, OperationalError
 from sqlalchemy.orm import joinedload, selectinload, Session
 
 # First-Party
@@ -436,6 +436,21 @@ class ToolService:
             request_timeout=int(settings.oauth_request_timeout if hasattr(settings, "oauth_request_timeout") else 30),
             max_retries=int(settings.oauth_max_retries if hasattr(settings, "oauth_max_retries") else 3),
         )
+
+    @staticmethod
+    def _safe_rollback(db: "Session") -> None:
+        """Roll back the session only if the underlying transaction is still active.
+
+        Avoids the ``SAWarning: transaction already deassociated from
+        connection`` that occurs when calling ``rollback()`` on a session
+        whose transaction has already been invalidated (e.g. due to a
+        prior commit failure or connection reset).
+        """
+        try:
+            if db.is_active:
+                db.rollback()
+        except Exception:  # noqa: BLE001 – best-effort cleanup
+            logger.debug("Suppressed error during safe rollback", exc_info=True)
 
     async def initialize(self) -> None:
         """Initialize the service.
@@ -1151,7 +1166,17 @@ class ToolService:
                 plugin_chain_post=tool.plugin_chain_post if tool.integration_type == "REST" else None,
             )
             db.add(db_tool)
-            db.commit()
+            try:
+                db.commit()
+            except InvalidRequestError:
+                # Transaction was silently invalidated (e.g. connection reset
+                # by PgBouncer or an earlier implicit rollback).  Start a fresh
+                # transaction, re-add the transient object and retry once.
+                logger.warning("Transaction inactive during tool commit — retrying with fresh transaction")
+                db.rollback()
+                db.begin()
+                db.add(db_tool)
+                db.commit()
             db.refresh(db_tool)
             await self._notify_tool_added(db_tool)
 
@@ -1214,7 +1239,7 @@ class ToolService:
 
             return self.convert_tool_to_read(db_tool, requesting_user_email=getattr(db_tool, "owner_email", None))
         except IntegrityError as ie:
-            db.rollback()
+            self._safe_rollback(db)
             logger.error(f"IntegrityError during tool registration: {ie}")
 
             # Structured logging: Log database integrity error
@@ -1232,7 +1257,7 @@ class ToolService:
             )
             raise ie
         except ToolNameConflictError as tnce:
-            db.rollback()
+            self._safe_rollback(db)
             logger.error(f"ToolNameConflictError during tool registration: {tnce}")
 
             # Structured logging: Log name conflict error
@@ -1250,7 +1275,7 @@ class ToolService:
             )
             raise tnce
         except Exception as e:
-            db.rollback()
+            self._safe_rollback(db)
 
             # Structured logging: Log generic tool creation failure
             structured_logger.log(

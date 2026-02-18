@@ -442,47 +442,55 @@ class TokenScopingMiddleware:
         from sqlalchemy import select  # pylint: disable=import-outside-toplevel
 
         # First-Party
-        from mcpgateway.db import EmailTeamMember, get_db  # pylint: disable=import-outside-toplevel
+        from mcpgateway.db import EmailTeamMember, fresh_db_session  # pylint: disable=import-outside-toplevel
 
-        # Track if we own the session (and thus must clean it up)
-        owns_session = db is None
-        if owns_session:
-            db = next(get_db())
+        # Use context manager for proper session lifecycle when we own the session
+        if db is not None:
+            return self._query_team_membership(db, select, EmailTeamMember, team_ids, user_email, auth_cache)
 
-        try:
-            # Single query for all teams (fixes N+1 pattern)
-            memberships = (
-                db.execute(
-                    select(EmailTeamMember.team_id).where(
-                        EmailTeamMember.team_id.in_(team_ids),
-                        EmailTeamMember.user_email == user_email,
-                        EmailTeamMember.is_active.is_(True),
-                    )
+        with fresh_db_session() as db:
+            return self._query_team_membership(db, select, EmailTeamMember, team_ids, user_email, auth_cache)
+
+    def _query_team_membership(self, db, select, EmailTeamMember, team_ids, user_email, auth_cache) -> bool:
+        """Execute team membership query against the database.
+
+        Args:
+            db: Database session
+            select: SQLAlchemy select function
+            EmailTeamMember: ORM model for email team members
+            team_ids: List of team IDs to check
+            user_email: User email to check membership for
+            auth_cache: Cache instance for storing results
+
+        Returns:
+            bool: True if user is member of all teams, False otherwise
+        """
+        # Single query for all teams (fixes N+1 pattern)
+        memberships = (
+            db.execute(
+                select(EmailTeamMember.team_id).where(
+                    EmailTeamMember.team_id.in_(team_ids),
+                    EmailTeamMember.user_email == user_email,
+                    EmailTeamMember.is_active.is_(True),
                 )
-                .scalars()
-                .all()
             )
+            .scalars()
+            .all()
+        )
 
-            # Check if user is member of ALL teams in token
-            valid_team_ids = set(memberships)
-            missing_teams = set(team_ids) - valid_team_ids
+        # Check if user is member of ALL teams in token
+        valid_team_ids = set(memberships)
+        missing_teams = set(team_ids) - valid_team_ids
 
-            if missing_teams:
-                logger.warning(f"Token invalid: User {user_email} no longer member of teams: {missing_teams}")
-                # Cache negative result
-                auth_cache.set_team_membership_valid_sync(user_email, team_ids, False)
-                return False
+        if missing_teams:
+            logger.warning(f"Token invalid: User {user_email} no longer member of teams: {missing_teams}")
+            # Cache negative result
+            auth_cache.set_team_membership_valid_sync(user_email, team_ids, False)
+            return False
 
-            # Cache positive result
-            auth_cache.set_team_membership_valid_sync(user_email, team_ids, True)
-            return True
-        finally:
-            # Only commit/close if we created the session
-            if owns_session:
-                try:
-                    db.commit()  # Commit read-only transaction to avoid implicit rollback
-                finally:
-                    db.close()
+        # Cache positive result
+        auth_cache.set_team_membership_valid_sync(user_email, team_ids, True)
+        return True
 
     def _check_resource_team_ownership(self, request_path: str, token_teams: list, db=None, _user_email: str = None) -> bool:  # pylint: disable=too-many-return-statements
         """
@@ -554,13 +562,18 @@ class TokenScopingMiddleware:
         from sqlalchemy import select  # pylint: disable=import-outside-toplevel
 
         # First-Party
-        from mcpgateway.db import Gateway, get_db, Prompt, Resource, Server, Tool  # pylint: disable=import-outside-toplevel
+        from mcpgateway.db import fresh_db_session, Gateway, Prompt, Resource, Server, Tool  # pylint: disable=import-outside-toplevel
 
-        # Track if we own the session (and thus must clean it up)
-        owns_session = db is None
-        if owns_session:
-            db = next(get_db())
+        # Use context manager for proper session lifecycle when we own the session
+        if db is None:
+            with fresh_db_session() as db:
+                return self._query_resource_ownership(db, select, resource_id, resource_type, token_team_ids, is_public_token, _user_email, request_path, Server, Tool, Resource, Prompt, Gateway)
+        return self._query_resource_ownership(db, select, resource_id, resource_type, token_team_ids, is_public_token, _user_email, request_path, Server, Tool, Resource, Prompt, Gateway)
 
+    def _query_resource_ownership(  # pylint: disable=too-many-return-statements,too-many-arguments,too-many-positional-arguments
+        self, db, select, resource_id, resource_type, token_team_ids, is_public_token, _user_email, request_path, Server, Tool, Resource, Prompt, Gateway
+    ) -> bool:
+        """Execute resource ownership query against the database."""
         try:
             # Check Virtual Servers
             if resource_type == "server":
@@ -799,13 +812,6 @@ class TokenScopingMiddleware:
             logger.error(f"Error checking resource team ownership for {request_path}: {e}", exc_info=True)
             # Fail securely - deny access on error
             return False
-        finally:
-            # Only commit/close if we created the session
-            if owns_session:
-                try:
-                    db.commit()  # Commit read-only transaction to avoid implicit rollback
-                finally:
-                    db.close()
 
     async def __call__(self, request: Request, call_next):
         """Middleware function to check token scoping including team-level validation.
@@ -890,10 +896,9 @@ class TokenScopingMiddleware:
                 # Skip to other checks (server_id, IP, etc.)
             elif token_teams:
                 # First-Party
-                from mcpgateway.db import get_db  # pylint: disable=import-outside-toplevel
+                from mcpgateway.db import fresh_db_session  # pylint: disable=import-outside-toplevel
 
-                db = next(get_db())
-                try:
+                with fresh_db_session() as db:
                     # Check team membership with shared session
                     if not self._check_team_membership(payload, db=db):
                         logger.warning("Token rejected: User no longer member of associated team(s)")
@@ -903,12 +908,6 @@ class TokenScopingMiddleware:
                     if not self._check_resource_team_ownership(request.url.path, token_teams, db=db, _user_email=user_email):
                         logger.warning(f"Access denied: Resource does not belong to token's teams {token_teams}")
                         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied: You do not have permission to access this resource using the current token")
-                finally:
-                    # Ensure session cleanup even if checks raise exceptions
-                    try:
-                        db.commit()
-                    finally:
-                        db.close()
             else:
                 # Public-only token: no team membership check needed, but still check resource ownership
                 if not self._check_team_membership(payload):

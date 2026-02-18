@@ -64,7 +64,7 @@ class TestTokenScopingMiddleware:
 
         # Test server restriction check - /admin should NOT be in general endpoints
         result = middleware._check_server_restriction("/admin/users", "server-123")
-        assert result == False, "Admin endpoints should not bypass server scoping restrictions"
+        assert not result, "Admin endpoints should not bypass server scoping restrictions"
 
     @pytest.mark.asyncio
     async def test_health_endpoints_still_whitelisted(self, middleware, mock_request):
@@ -73,40 +73,40 @@ class TestTokenScopingMiddleware:
 
         for path in whitelist_paths:
             result = middleware._check_server_restriction(path, "server-123")
-            assert result == True, f"Path {path} should remain whitelisted"
+            assert result, f"Path {path} should remain whitelisted"
 
     def test_rpc_endpoint_whitelisted_for_server_scoped_tokens(self, middleware):
         """Test that /rpc endpoint is whitelisted for server-scoped tokens."""
         # The /rpc endpoint is required for MCP protocol operations (SSE transport)
         result = middleware._check_server_restriction("/rpc", "server-123")
-        assert result == True, "/rpc endpoint should be whitelisted for server-scoped tokens"
+        assert result, "/rpc endpoint should be whitelisted for server-scoped tokens"
 
     @pytest.mark.asyncio
     async def test_canonical_permissions_used_in_map(self, middleware):
         """Test that permission map uses canonical Permissions constants (Issue 5 fix)."""
         # Test tools permissions use canonical constants
         result = middleware._check_permission_restrictions("/tools", "GET", [Permissions.TOOLS_READ])
-        assert result == True, "Should accept canonical TOOLS_READ permission"
+        assert result, "Should accept canonical TOOLS_READ permission"
 
         result = middleware._check_permission_restrictions("/tools", "POST", [Permissions.TOOLS_CREATE])
-        assert result == True, "Should accept canonical TOOLS_CREATE permission"
+        assert result, "Should accept canonical TOOLS_CREATE permission"
 
         # Test that old non-canonical permissions would not work
         result = middleware._check_permission_restrictions("/tools", "POST", ["tools.write"])
-        assert result == False, "Should reject non-canonical 'tools.write' permission"
+        assert not result, "Should reject non-canonical 'tools.write' permission"
 
     @pytest.mark.asyncio
     async def test_admin_permissions_use_canonical_constants(self, middleware):
         """Test that admin endpoints use canonical admin permissions."""
         result = middleware._check_permission_restrictions("/admin", "GET", [Permissions.ADMIN_USER_MANAGEMENT])
-        assert result == True, "Should accept canonical ADMIN_USER_MANAGEMENT permission"
+        assert result, "Should accept canonical ADMIN_USER_MANAGEMENT permission"
 
         result = middleware._check_permission_restrictions("/admin/users", "POST", [Permissions.ADMIN_USER_MANAGEMENT])
-        assert result == True, "Should accept canonical ADMIN_USER_MANAGEMENT for admin operations"
+        assert result, "Should accept canonical ADMIN_USER_MANAGEMENT for admin operations"
 
         # Test that old non-canonical admin permissions would not work
         result = middleware._check_permission_restrictions("/admin", "GET", ["admin.read"])
-        assert result == False, "Should reject non-canonical 'admin.read' permission"
+        assert not result, "Should reject non-canonical 'admin.read' permission"
 
     @pytest.mark.asyncio
     async def test_server_scoped_token_blocked_from_admin(self, middleware, mock_request):
@@ -230,9 +230,9 @@ class TestTokenScopingMiddleware:
     async def test_regex_pattern_precision_tools(self, middleware):
         """Test that regex patterns match path segments precisely."""
         # Test exact /tools path matches for GET (should require TOOLS_READ)
-        assert middleware._check_permission_restrictions("/tools", "GET", [Permissions.TOOLS_READ]) == True
-        assert middleware._check_permission_restrictions("/tools/", "GET", [Permissions.TOOLS_READ]) == True
-        assert middleware._check_permission_restrictions("/tools/abc", "GET", [Permissions.TOOLS_READ]) == True
+        assert middleware._check_permission_restrictions("/tools", "GET", [Permissions.TOOLS_READ])
+        assert middleware._check_permission_restrictions("/tools/", "GET", [Permissions.TOOLS_READ])
+        assert middleware._check_permission_restrictions("/tools/abc", "GET", [Permissions.TOOLS_READ])
 
     def test_permission_restrictions_default_allow_for_unmatched_path(self, middleware):
         """Unmatched paths should default-allow when permissions list is non-empty."""
@@ -268,14 +268,12 @@ class TestTokenScopingMiddleware:
         result_proxy.scalars.return_value.all.return_value = ["team-1", "team-2"]
         db.execute.return_value = result_proxy
 
-        def _get_db():
-            yield db
-
-        monkeypatch.setattr("mcpgateway.db.get_db", _get_db)
-        assert middleware._check_team_membership(payload) is True
-        cache.set_team_membership_valid_sync.assert_called_with("user@example.com", ["team-1", "team-2"], True)
-        db.commit.assert_called_once()
-        db.close.assert_called_once()
+        with patch("mcpgateway.db.fresh_db_session") as mock_fresh:
+            mock_fresh.return_value.__enter__ = MagicMock(return_value=db)
+            mock_fresh.return_value.__exit__ = MagicMock(return_value=False)
+            assert middleware._check_team_membership(payload) is True
+            cache.set_team_membership_valid_sync.assert_called_with("user@example.com", ["team-1", "team-2"], True)
+            mock_fresh.assert_called_once()
 
         # Missing team case
         db = MagicMock()
@@ -283,12 +281,11 @@ class TestTokenScopingMiddleware:
         result_proxy.scalars.return_value.all.return_value = ["team-1"]
         db.execute.return_value = result_proxy
 
-        def _get_db_missing():
-            yield db
-
-        monkeypatch.setattr("mcpgateway.db.get_db", _get_db_missing)
-        assert middleware._check_team_membership(payload) is False
-        cache.set_team_membership_valid_sync.assert_called_with("user@example.com", ["team-1", "team-2"], False)
+        with patch("mcpgateway.db.fresh_db_session") as mock_fresh:
+            mock_fresh.return_value.__enter__ = MagicMock(return_value=db)
+            mock_fresh.return_value.__exit__ = MagicMock(return_value=False)
+            assert middleware._check_team_membership(payload) is False
+            cache.set_team_membership_valid_sync.assert_called_with("user@example.com", ["team-1", "team-2"], False)
 
     def test_check_resource_team_ownership_tool_and_resource(self, middleware):
         """Check tool/resource visibility enforcement."""
@@ -309,59 +306,59 @@ class TestTokenScopingMiddleware:
         assert middleware._check_resource_team_ownership("/resources/abc", ["team-1"], db=db, _user_email="user@example.com") is True
 
         # Test that GET /tools requires TOOLS_READ permission specifically
-        assert middleware._check_permission_restrictions("/tools", "GET", [Permissions.TOOLS_CREATE]) == False
+        assert not middleware._check_permission_restrictions("/tools", "GET", [Permissions.TOOLS_CREATE])
         # Note: Empty permissions list returns True due to "no restrictions" logic
-        assert middleware._check_permission_restrictions("/tools", "GET", []) == True
+        assert middleware._check_permission_restrictions("/tools", "GET", [])
 
         # Test POST /tools requires TOOLS_CREATE permission specifically
-        assert middleware._check_permission_restrictions("/tools", "POST", [Permissions.TOOLS_CREATE]) == True
-        assert middleware._check_permission_restrictions("/tools", "POST", [Permissions.TOOLS_READ]) == False
+        assert middleware._check_permission_restrictions("/tools", "POST", [Permissions.TOOLS_CREATE])
+        assert not middleware._check_permission_restrictions("/tools", "POST", [Permissions.TOOLS_READ])
 
         # Test specific tool ID patterns for PUT/DELETE
-        assert middleware._check_permission_restrictions("/tools/tool-123", "PUT", [Permissions.TOOLS_UPDATE]) == True
-        assert middleware._check_permission_restrictions("/tools/tool-123", "DELETE", [Permissions.TOOLS_DELETE]) == True
+        assert middleware._check_permission_restrictions("/tools/tool-123", "PUT", [Permissions.TOOLS_UPDATE])
+        assert middleware._check_permission_restrictions("/tools/tool-123", "DELETE", [Permissions.TOOLS_DELETE])
 
         # Test wrong permissions for tool operations
-        assert middleware._check_permission_restrictions("/tools/tool-123", "PUT", [Permissions.TOOLS_READ]) == False
-        assert middleware._check_permission_restrictions("/tools/tool-123", "DELETE", [Permissions.TOOLS_UPDATE]) == False
+        assert not middleware._check_permission_restrictions("/tools/tool-123", "PUT", [Permissions.TOOLS_READ])
+        assert not middleware._check_permission_restrictions("/tools/tool-123", "DELETE", [Permissions.TOOLS_UPDATE])
 
     @pytest.mark.asyncio
     async def test_regex_pattern_precision_admin(self, middleware):
         """Test that admin regex patterns require correct permissions."""
         # Test exact /admin path requires ADMIN_USER_MANAGEMENT
-        assert middleware._check_permission_restrictions("/admin", "GET", [Permissions.ADMIN_USER_MANAGEMENT]) == True
-        assert middleware._check_permission_restrictions("/admin/", "GET", [Permissions.ADMIN_USER_MANAGEMENT]) == True
+        assert middleware._check_permission_restrictions("/admin", "GET", [Permissions.ADMIN_USER_MANAGEMENT])
+        assert middleware._check_permission_restrictions("/admin/", "GET", [Permissions.ADMIN_USER_MANAGEMENT])
 
         # Test admin operations require admin permissions
-        assert middleware._check_permission_restrictions("/admin/users", "POST", [Permissions.ADMIN_USER_MANAGEMENT]) == True
-        assert middleware._check_permission_restrictions("/admin/teams", "PUT", [Permissions.ADMIN_USER_MANAGEMENT]) == True
+        assert middleware._check_permission_restrictions("/admin/users", "POST", [Permissions.ADMIN_USER_MANAGEMENT])
+        assert middleware._check_permission_restrictions("/admin/teams", "PUT", [Permissions.ADMIN_USER_MANAGEMENT])
 
         # Test that non-admin permissions are rejected for admin paths
-        assert middleware._check_permission_restrictions("/admin", "GET", [Permissions.TOOLS_READ]) == False
-        assert middleware._check_permission_restrictions("/admin/users", "POST", [Permissions.RESOURCES_CREATE]) == False
+        assert not middleware._check_permission_restrictions("/admin", "GET", [Permissions.TOOLS_READ])
+        assert not middleware._check_permission_restrictions("/admin/users", "POST", [Permissions.RESOURCES_CREATE])
 
         # Test that empty permissions list returns True (no restrictions policy)
-        assert middleware._check_permission_restrictions("/admin", "GET", []) == True
+        assert middleware._check_permission_restrictions("/admin", "GET", [])
 
     @pytest.mark.asyncio
     async def test_regex_pattern_precision_servers(self, middleware):
         """Test that server path patterns require correct permissions."""
         # Test exact /servers path requires SERVERS_READ
-        assert middleware._check_permission_restrictions("/servers", "GET", [Permissions.SERVERS_READ]) == True
-        assert middleware._check_permission_restrictions("/servers/", "GET", [Permissions.SERVERS_READ]) == True
+        assert middleware._check_permission_restrictions("/servers", "GET", [Permissions.SERVERS_READ])
+        assert middleware._check_permission_restrictions("/servers/", "GET", [Permissions.SERVERS_READ])
 
         # Test specific server operations require correct permissions
-        assert middleware._check_permission_restrictions("/servers/server-123", "PUT", [Permissions.SERVERS_UPDATE]) == True
-        assert middleware._check_permission_restrictions("/servers/server-123", "DELETE", [Permissions.SERVERS_DELETE]) == True
+        assert middleware._check_permission_restrictions("/servers/server-123", "PUT", [Permissions.SERVERS_UPDATE])
+        assert middleware._check_permission_restrictions("/servers/server-123", "DELETE", [Permissions.SERVERS_DELETE])
 
         # Test nested server paths for tools/resources
-        assert middleware._check_permission_restrictions("/servers/srv-1/tools", "GET", [Permissions.TOOLS_READ]) == True
-        assert middleware._check_permission_restrictions("/servers/srv-1/tools/tool-1/call", "POST", [Permissions.TOOLS_EXECUTE]) == True
-        assert middleware._check_permission_restrictions("/servers/srv-1/resources", "GET", [Permissions.RESOURCES_READ]) == True
+        assert middleware._check_permission_restrictions("/servers/srv-1/tools", "GET", [Permissions.TOOLS_READ])
+        assert middleware._check_permission_restrictions("/servers/srv-1/tools/tool-1/call", "POST", [Permissions.TOOLS_EXECUTE])
+        assert middleware._check_permission_restrictions("/servers/srv-1/resources", "GET", [Permissions.RESOURCES_READ])
 
         # Test wrong permissions for server operations
-        assert middleware._check_permission_restrictions("/servers", "GET", [Permissions.TOOLS_READ]) == False
-        assert middleware._check_permission_restrictions("/servers/server-123", "PUT", [Permissions.SERVERS_READ]) == False
+        assert not middleware._check_permission_restrictions("/servers", "GET", [Permissions.TOOLS_READ])
+        assert not middleware._check_permission_restrictions("/servers/server-123", "PUT", [Permissions.SERVERS_READ])
 
     @pytest.mark.asyncio
     async def test_virtual_mcp_server_permission_pattern(self, middleware):
@@ -374,49 +371,29 @@ class TestTokenScopingMiddleware:
         The fix changes the pattern to ^/servers/?$ to only match exact paths.
         """
         # servers.create should be required ONLY for creating servers (exact path match)
-        assert middleware._check_permission_restrictions(
-            "/servers", "POST", [Permissions.SERVERS_READ, Permissions.TOOLS_READ]
-        ) == False, "POST /servers should require servers.create"
+        assert not middleware._check_permission_restrictions("/servers", "POST", [Permissions.SERVERS_READ, Permissions.TOOLS_READ]), "POST /servers should require servers.create"
 
-        assert middleware._check_permission_restrictions(
-            "/servers/", "POST", [Permissions.SERVERS_READ, Permissions.TOOLS_READ]
-        ) == False, "POST /servers/ should require servers.create"
+        assert not middleware._check_permission_restrictions("/servers/", "POST", [Permissions.SERVERS_READ, Permissions.TOOLS_READ]), "POST /servers/ should require servers.create"
 
-        assert middleware._check_permission_restrictions(
-            "/servers", "POST", [Permissions.SERVERS_CREATE]
-        ) == True, "POST /servers should succeed with servers.create"
+        assert middleware._check_permission_restrictions("/servers", "POST", [Permissions.SERVERS_CREATE]), "POST /servers should succeed with servers.create"
 
         # Virtual MCP Server access should NOT require servers.create (this is the fix!)
-        assert middleware._check_permission_restrictions(
-            "/servers/3d7c7ab6a5264dadb8c7f4e04758295b/mcp",
-            "POST",
-            [Permissions.SERVERS_READ, Permissions.TOOLS_READ]
-        ) == False, "POST /servers/{id}/mcp should require servers.use, not servers.read"
+        assert not middleware._check_permission_restrictions(
+            "/servers/3d7c7ab6a5264dadb8c7f4e04758295b/mcp", "POST", [Permissions.SERVERS_READ, Permissions.TOOLS_READ]
+        ), "POST /servers/{id}/mcp should require servers.use, not servers.read"
 
-        assert middleware._check_permission_restrictions(
-            "/servers/abc123/sse",
-            "GET",
-            [Permissions.SERVERS_USE]
-        ) == True, "GET /servers/{id}/sse should require servers.use"
-        assert middleware._check_permission_restrictions(
-            "/servers/abc123/sse",
-            "GET",
-            [Permissions.SERVERS_READ]
-        ) == False, "GET /servers/{id}/sse should NOT accept servers.read"
+        assert middleware._check_permission_restrictions("/servers/abc123/sse", "GET", [Permissions.SERVERS_USE]), "GET /servers/{id}/sse should require servers.use"
+        assert not middleware._check_permission_restrictions("/servers/abc123/sse", "GET", [Permissions.SERVERS_READ]), "GET /servers/{id}/sse should NOT accept servers.read"
 
         # Other Virtual MCP Server endpoints should also not require servers.create
-        assert middleware._check_permission_restrictions(
-            "/servers/test-server/mcp/",
-            "POST",
-            [Permissions.SERVERS_READ, Permissions.TOOLS_READ]
-        ) == False, "POST /servers/{id}/mcp/ should require servers.use"
+        assert not middleware._check_permission_restrictions(
+            "/servers/test-server/mcp/", "POST", [Permissions.SERVERS_READ, Permissions.TOOLS_READ]
+        ), "POST /servers/{id}/mcp/ should require servers.use"
 
         # Verify that servers.create works for Virtual MCP Server too (backward compatibility)
         assert middleware._check_permission_restrictions(
-            "/servers/3d7c7ab6a5264dadb8c7f4e04758295b/mcp",
-            "POST",
-            [Permissions.SERVERS_CREATE, Permissions.SERVERS_USE, Permissions.SERVERS_READ, Permissions.TOOLS_READ]
-        ) == True, "POST /servers/{id}/mcp should succeed when servers.use is present"
+            "/servers/3d7c7ab6a5264dadb8c7f4e04758295b/mcp", "POST", [Permissions.SERVERS_CREATE, Permissions.SERVERS_USE, Permissions.SERVERS_READ, Permissions.TOOLS_READ]
+        ), "POST /servers/{id}/mcp should succeed when servers.use is present"
 
     @pytest.mark.asyncio
     async def test_tools_create_pattern_exact_match(self, middleware):
@@ -427,20 +404,12 @@ class TestTokenScopingMiddleware:
         assert middleware._check_permission_restrictions("/tools", "POST", [Permissions.TOOLS_READ]) is False
 
         # POST /tools/{id}/state requires tools.update, NOT tools.create
-        assert middleware._check_permission_restrictions(
-            "/tools/tool-123/state", "POST", [Permissions.TOOLS_UPDATE]
-        ) is True, "POST /tools/{id}/state should require tools.update"
-        assert middleware._check_permission_restrictions(
-            "/tools/tool-123/state", "POST", [Permissions.TOOLS_CREATE]
-        ) is False, "POST /tools/{id}/state should NOT accept tools.create"
+        assert middleware._check_permission_restrictions("/tools/tool-123/state", "POST", [Permissions.TOOLS_UPDATE]) is True, "POST /tools/{id}/state should require tools.update"
+        assert middleware._check_permission_restrictions("/tools/tool-123/state", "POST", [Permissions.TOOLS_CREATE]) is False, "POST /tools/{id}/state should NOT accept tools.create"
 
         # POST /tools/{id}/toggle requires tools.update
-        assert middleware._check_permission_restrictions(
-            "/tools/tool-123/toggle", "POST", [Permissions.TOOLS_UPDATE]
-        ) is True, "POST /tools/{id}/toggle should require tools.update"
-        assert middleware._check_permission_restrictions(
-            "/tools/tool-123/toggle", "POST", [Permissions.TOOLS_CREATE]
-        ) is False, "POST /tools/{id}/toggle should NOT accept tools.create"
+        assert middleware._check_permission_restrictions("/tools/tool-123/toggle", "POST", [Permissions.TOOLS_UPDATE]) is True, "POST /tools/{id}/toggle should require tools.update"
+        assert middleware._check_permission_restrictions("/tools/tool-123/toggle", "POST", [Permissions.TOOLS_CREATE]) is False, "POST /tools/{id}/toggle should NOT accept tools.create"
 
     @pytest.mark.asyncio
     async def test_resources_create_pattern_exact_match(self, middleware):
@@ -451,25 +420,15 @@ class TestTokenScopingMiddleware:
         assert middleware._check_permission_restrictions("/resources", "POST", [Permissions.RESOURCES_READ]) is False
 
         # POST /resources/{id}/state requires resources.update, NOT resources.create
-        assert middleware._check_permission_restrictions(
-            "/resources/res-123/state", "POST", [Permissions.RESOURCES_UPDATE]
-        ) is True, "POST /resources/{id}/state should require resources.update"
-        assert middleware._check_permission_restrictions(
-            "/resources/res-123/state", "POST", [Permissions.RESOURCES_CREATE]
-        ) is False, "POST /resources/{id}/state should NOT accept resources.create"
+        assert middleware._check_permission_restrictions("/resources/res-123/state", "POST", [Permissions.RESOURCES_UPDATE]) is True, "POST /resources/{id}/state should require resources.update"
+        assert middleware._check_permission_restrictions("/resources/res-123/state", "POST", [Permissions.RESOURCES_CREATE]) is False, "POST /resources/{id}/state should NOT accept resources.create"
 
         # POST /resources/{id}/toggle requires resources.update
-        assert middleware._check_permission_restrictions(
-            "/resources/res-123/toggle", "POST", [Permissions.RESOURCES_UPDATE]
-        ) is True, "POST /resources/{id}/toggle should require resources.update"
+        assert middleware._check_permission_restrictions("/resources/res-123/toggle", "POST", [Permissions.RESOURCES_UPDATE]) is True, "POST /resources/{id}/toggle should require resources.update"
 
         # POST /resources/subscribe requires resources.read (SSE subscription)
-        assert middleware._check_permission_restrictions(
-            "/resources/subscribe", "POST", [Permissions.RESOURCES_READ]
-        ) is True, "POST /resources/subscribe should require resources.read"
-        assert middleware._check_permission_restrictions(
-            "/resources/subscribe", "POST", [Permissions.RESOURCES_CREATE]
-        ) is False, "POST /resources/subscribe should NOT accept resources.create"
+        assert middleware._check_permission_restrictions("/resources/subscribe", "POST", [Permissions.RESOURCES_READ]) is True, "POST /resources/subscribe should require resources.read"
+        assert middleware._check_permission_restrictions("/resources/subscribe", "POST", [Permissions.RESOURCES_CREATE]) is False, "POST /resources/subscribe should NOT accept resources.create"
 
     @pytest.mark.asyncio
     async def test_prompts_create_pattern_exact_match(self, middleware):
@@ -480,71 +439,39 @@ class TestTokenScopingMiddleware:
         assert middleware._check_permission_restrictions("/prompts", "POST", [Permissions.PROMPTS_READ]) is False
 
         # POST /prompts/{id}/state requires prompts.update, NOT prompts.create
-        assert middleware._check_permission_restrictions(
-            "/prompts/prompt-123/state", "POST", [Permissions.PROMPTS_UPDATE]
-        ) is True, "POST /prompts/{id}/state should require prompts.update"
-        assert middleware._check_permission_restrictions(
-            "/prompts/prompt-123/state", "POST", [Permissions.PROMPTS_CREATE]
-        ) is False, "POST /prompts/{id}/state should NOT accept prompts.create"
+        assert middleware._check_permission_restrictions("/prompts/prompt-123/state", "POST", [Permissions.PROMPTS_UPDATE]) is True, "POST /prompts/{id}/state should require prompts.update"
+        assert middleware._check_permission_restrictions("/prompts/prompt-123/state", "POST", [Permissions.PROMPTS_CREATE]) is False, "POST /prompts/{id}/state should NOT accept prompts.create"
 
         # POST /prompts/{id}/toggle requires prompts.update
-        assert middleware._check_permission_restrictions(
-            "/prompts/prompt-123/toggle", "POST", [Permissions.PROMPTS_UPDATE]
-        ) is True, "POST /prompts/{id}/toggle should require prompts.update"
+        assert middleware._check_permission_restrictions("/prompts/prompt-123/toggle", "POST", [Permissions.PROMPTS_UPDATE]) is True, "POST /prompts/{id}/toggle should require prompts.update"
 
         # POST /prompts/{id} (MCP spec retrieval) requires prompts.read
-        assert middleware._check_permission_restrictions(
-            "/prompts/prompt-123", "POST", [Permissions.PROMPTS_READ]
-        ) is True, "POST /prompts/{id} (MCP spec) should require prompts.read"
-        assert middleware._check_permission_restrictions(
-            "/prompts/prompt-123", "POST", [Permissions.PROMPTS_CREATE]
-        ) is False, "POST /prompts/{id} (MCP spec) should NOT accept prompts.create"
+        assert middleware._check_permission_restrictions("/prompts/prompt-123", "POST", [Permissions.PROMPTS_READ]) is True, "POST /prompts/{id} (MCP spec) should require prompts.read"
+        assert middleware._check_permission_restrictions("/prompts/prompt-123", "POST", [Permissions.PROMPTS_CREATE]) is False, "POST /prompts/{id} (MCP spec) should NOT accept prompts.create"
 
     @pytest.mark.asyncio
     async def test_servers_subresource_permission_patterns(self, middleware):
         """Test that server sub-paths distinguish management (update) from access (read) endpoints."""
         # POST /servers/{id}/state requires servers.update (management)
-        assert middleware._check_permission_restrictions(
-            "/servers/srv-123/state", "POST", [Permissions.SERVERS_UPDATE]
-        ) is True, "POST /servers/{id}/state should require servers.update"
-        assert middleware._check_permission_restrictions(
-            "/servers/srv-123/state", "POST", [Permissions.SERVERS_CREATE]
-        ) is False, "POST /servers/{id}/state should NOT accept servers.create"
-        assert middleware._check_permission_restrictions(
-            "/servers/srv-123/state", "POST", [Permissions.SERVERS_READ]
-        ) is False, "POST /servers/{id}/state should NOT accept servers.read"
+        assert middleware._check_permission_restrictions("/servers/srv-123/state", "POST", [Permissions.SERVERS_UPDATE]) is True, "POST /servers/{id}/state should require servers.update"
+        assert middleware._check_permission_restrictions("/servers/srv-123/state", "POST", [Permissions.SERVERS_CREATE]) is False, "POST /servers/{id}/state should NOT accept servers.create"
+        assert middleware._check_permission_restrictions("/servers/srv-123/state", "POST", [Permissions.SERVERS_READ]) is False, "POST /servers/{id}/state should NOT accept servers.read"
 
         # POST /servers/{id}/toggle requires servers.update (management)
-        assert middleware._check_permission_restrictions(
-            "/servers/srv-123/toggle", "POST", [Permissions.SERVERS_UPDATE]
-        ) is True, "POST /servers/{id}/toggle should require servers.update"
-        assert middleware._check_permission_restrictions(
-            "/servers/srv-123/toggle", "POST", [Permissions.SERVERS_CREATE]
-        ) is False, "POST /servers/{id}/toggle should NOT accept servers.create"
+        assert middleware._check_permission_restrictions("/servers/srv-123/toggle", "POST", [Permissions.SERVERS_UPDATE]) is True, "POST /servers/{id}/toggle should require servers.update"
+        assert middleware._check_permission_restrictions("/servers/srv-123/toggle", "POST", [Permissions.SERVERS_CREATE]) is False, "POST /servers/{id}/toggle should NOT accept servers.create"
 
         # POST /servers/{id}/mcp requires servers.use (access endpoint)
-        assert middleware._check_permission_restrictions(
-            "/servers/srv-123/mcp", "POST", [Permissions.SERVERS_USE]
-        ) is True, "POST /servers/{id}/mcp should require servers.use"
-        assert middleware._check_permission_restrictions(
-            "/servers/srv-123/mcp", "POST", [Permissions.SERVERS_READ]
-        ) is False, "POST /servers/{id}/mcp should NOT accept servers.read"
+        assert middleware._check_permission_restrictions("/servers/srv-123/mcp", "POST", [Permissions.SERVERS_USE]) is True, "POST /servers/{id}/mcp should require servers.use"
+        assert middleware._check_permission_restrictions("/servers/srv-123/mcp", "POST", [Permissions.SERVERS_READ]) is False, "POST /servers/{id}/mcp should NOT accept servers.read"
 
         # GET /servers/{id}/sse requires servers.use (access endpoint)
-        assert middleware._check_permission_restrictions(
-            "/servers/srv-123/sse", "GET", [Permissions.SERVERS_USE]
-        ) is True, "GET /servers/{id}/sse should require servers.use"
-        assert middleware._check_permission_restrictions(
-            "/servers/srv-123/sse", "GET", [Permissions.SERVERS_READ]
-        ) is False, "GET /servers/{id}/sse should NOT accept servers.read"
+        assert middleware._check_permission_restrictions("/servers/srv-123/sse", "GET", [Permissions.SERVERS_USE]) is True, "GET /servers/{id}/sse should require servers.use"
+        assert middleware._check_permission_restrictions("/servers/srv-123/sse", "GET", [Permissions.SERVERS_READ]) is False, "GET /servers/{id}/sse should NOT accept servers.read"
 
         # POST /servers/{id}/message requires servers.use (access endpoint)
-        assert middleware._check_permission_restrictions(
-            "/servers/srv-123/message", "POST", [Permissions.SERVERS_USE]
-        ) is True, "POST /servers/{id}/message should require servers.use"
-        assert middleware._check_permission_restrictions(
-            "/servers/srv-123/message", "POST", [Permissions.SERVERS_READ]
-        ) is False, "POST /servers/{id}/message should NOT accept servers.read"
+        assert middleware._check_permission_restrictions("/servers/srv-123/message", "POST", [Permissions.SERVERS_USE]) is True, "POST /servers/{id}/message should require servers.use"
+        assert middleware._check_permission_restrictions("/servers/srv-123/message", "POST", [Permissions.SERVERS_READ]) is False, "POST /servers/{id}/message should NOT accept servers.read"
 
     @pytest.mark.asyncio
     async def test_permission_pattern_consistency(self, middleware):
@@ -559,23 +486,15 @@ class TestTokenScopingMiddleware:
 
         for resource, create_perm, update_perm in resource_types:
             # Exact POST requires create permission
-            assert middleware._check_permission_restrictions(
-                f"/{resource}", "POST", [create_perm]
-            ) is True, f"POST /{resource} should accept {create_perm}"
+            assert middleware._check_permission_restrictions(f"/{resource}", "POST", [create_perm]) is True, f"POST /{resource} should accept {create_perm}"
 
             # Exact POST rejects read-only
-            assert middleware._check_permission_restrictions(
-                f"/{resource}", "POST", ["read.only"]
-            ) is False, f"POST /{resource} should reject non-create permission"
+            assert middleware._check_permission_restrictions(f"/{resource}", "POST", ["read.only"]) is False, f"POST /{resource} should reject non-create permission"
 
             # Sub-path POST should NOT require create permission (except servers which uses default-allow)
             if update_perm:
-                assert middleware._check_permission_restrictions(
-                    f"/{resource}/item-123/state", "POST", [update_perm]
-                ) is True, f"POST /{resource}/item-123/state should accept {update_perm}"
-                assert middleware._check_permission_restrictions(
-                    f"/{resource}/item-123/state", "POST", [create_perm]
-                ) is False, f"POST /{resource}/item-123/state should reject {create_perm}"
+                assert middleware._check_permission_restrictions(f"/{resource}/item-123/state", "POST", [update_perm]) is True, f"POST /{resource}/item-123/state should accept {update_perm}"
+                assert middleware._check_permission_restrictions(f"/{resource}/item-123/state", "POST", [create_perm]) is False, f"POST /{resource}/item-123/state should reject {create_perm}"
 
     @pytest.mark.asyncio
     async def test_regex_pattern_segment_boundaries(self, middleware):
@@ -587,7 +506,7 @@ class TestTokenScopingMiddleware:
         for path in edge_case_paths:
             # These should return True due to default allow (proving they don't falsely match patterns)
             result = middleware._check_permission_restrictions(path, "GET", [])
-            assert result == True, f"Unmatched path {path} should get default allow"
+            assert result, f"Unmatched path {path} should get default allow"
 
         # Test that exact patterns still work correctly
         exact_matches = [
@@ -810,26 +729,23 @@ class TestTokenScopingMiddleware:
         payload = {"sub": "user@example.com", "token_use": "session", "user": {"is_admin": True}, "scopes": {"permissions": ["*"]}}
         db = MagicMock()
 
-        def _get_db():
-            yield db
-
-        monkeypatch.setattr("mcpgateway.db.get_db", _get_db)
-
         with (
             patch.object(middleware, "_extract_token_scopes", return_value=payload),
             patch.object(middleware, "_check_team_membership", return_value=True),
             patch.object(middleware, "_check_resource_team_ownership", return_value=True),
             patch("mcpgateway.auth._resolve_teams_from_db", new=AsyncMock(return_value=["team-1"])),
+            patch("mcpgateway.db.fresh_db_session") as mock_fresh,
         ):
+            mock_fresh.return_value.__enter__ = MagicMock(return_value=db)
+            mock_fresh.return_value.__exit__ = MagicMock(return_value=False)
             call_next = AsyncMock(return_value="ok")
             assert await middleware(mock_request, call_next) == "ok"
             call_next.assert_called_once()
-            assert db.commit.called
-            assert db.close.called
+            mock_fresh.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_team_scoped_token_uses_shared_db(self, middleware, mock_request, monkeypatch):
-        """Team-scoped tokens should validate membership and resource ownership with shared DB session."""
+        """Team-scoped tokens should validate membership and resource ownership with fresh_db_session."""
         mock_request.url.path = "/servers/server-123"
         mock_request.method = "GET"
         mock_request.headers = {"Authorization": "Bearer token"}
@@ -837,23 +753,20 @@ class TestTokenScopingMiddleware:
         payload = {"sub": "user@example.com", "teams": ["team-1"], "scopes": {"permissions": ["*"]}}
         db = MagicMock()
 
-        def _get_db():
-            yield db
-
-        monkeypatch.setattr("mcpgateway.db.get_db", _get_db)
-
         with (
             patch.object(middleware, "_extract_token_scopes", return_value=payload),
             patch.object(middleware, "_check_team_membership", return_value=True),
             patch.object(middleware, "_check_resource_team_ownership", return_value=True),
             patch.object(middleware, "_check_server_restriction", return_value=True),
             patch.object(middleware, "_check_permission_restrictions", return_value=True),
+            patch("mcpgateway.db.fresh_db_session") as mock_fresh,
         ):
+            mock_fresh.return_value.__enter__ = MagicMock(return_value=db)
+            mock_fresh.return_value.__exit__ = MagicMock(return_value=False)
             call_next = AsyncMock(return_value="ok")
             result = await middleware(mock_request, call_next)
             assert result == "ok"
-            assert db.commit.called
-            assert db.close.called
+            mock_fresh.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_public_only_token_rejected_when_membership_invalid(self, middleware, mock_request):
@@ -951,8 +864,8 @@ def test_check_resource_team_ownership_normalizes_team_dict_and_allows_team_reso
     assert middleware._check_resource_team_ownership("/resources/a1b2c3d4", [{"id": "team-1"}], db=db, _user_email="user@example.com") is True
 
 
-def test_check_resource_team_ownership_owns_session_commits_and_closes(monkeypatch):
-    """When middleware owns the DB session, it should commit and close in the finally block."""
+def test_check_resource_team_ownership_owns_session_uses_fresh_db_session(monkeypatch):
+    """When middleware owns the DB session, it should use fresh_db_session() context manager."""
     middleware = TokenScopingMiddleware()
     db = MagicMock()
 
@@ -960,14 +873,11 @@ def test_check_resource_team_ownership_owns_session_commits_and_closes(monkeypat
     resource.visibility = "public"
     db.execute.return_value.scalar_one_or_none.return_value = resource
 
-    def _get_db():
-        yield db
-
-    monkeypatch.setattr("mcpgateway.db.get_db", _get_db)
-
-    assert middleware._check_resource_team_ownership("/resources/a1b2c3d4", ["team-1"], _user_email="user@example.com") is True
-    db.commit.assert_called_once()
-    db.close.assert_called_once()
+    with patch("mcpgateway.db.fresh_db_session") as mock_fresh:
+        mock_fresh.return_value.__enter__ = MagicMock(return_value=db)
+        mock_fresh.return_value.__exit__ = MagicMock(return_value=False)
+        assert middleware._check_resource_team_ownership("/resources/a1b2c3d4", ["team-1"], _user_email="user@example.com") is True
+        mock_fresh.assert_called_once()
 
 
 def test_check_resource_team_ownership_public_only_token_denied_for_team_prompt():
@@ -1110,15 +1020,13 @@ async def test_team_scoped_membership_denied(monkeypatch):
     payload = {"sub": "user@example.com", "teams": ["team-1"], "scopes": {"permissions": ["*"]}}
     db = MagicMock()
 
-    def _get_db():
-        yield db
-
-    monkeypatch.setattr("mcpgateway.db.get_db", _get_db)
-
     with (
         patch.object(middleware, "_extract_token_scopes", return_value=payload),
         patch.object(middleware, "_check_team_membership", return_value=False),
+        patch("mcpgateway.db.fresh_db_session") as mock_fresh,
     ):
+        mock_fresh.return_value.__enter__ = MagicMock(return_value=db)
+        mock_fresh.return_value.__exit__ = MagicMock(return_value=False)
         call_next = AsyncMock()
         response = await middleware(mock_request, call_next)
         assert response.status_code == status.HTTP_403_FORBIDDEN
@@ -1133,16 +1041,14 @@ async def test_team_scoped_resource_denied(monkeypatch):
     payload = {"sub": "user@example.com", "teams": ["team-1"], "scopes": {"permissions": ["*"]}}
     db = MagicMock()
 
-    def _get_db():
-        yield db
-
-    monkeypatch.setattr("mcpgateway.db.get_db", _get_db)
-
     with (
         patch.object(middleware, "_extract_token_scopes", return_value=payload),
         patch.object(middleware, "_check_team_membership", return_value=True),
         patch.object(middleware, "_check_resource_team_ownership", return_value=False),
+        patch("mcpgateway.db.fresh_db_session") as mock_fresh,
     ):
+        mock_fresh.return_value.__enter__ = MagicMock(return_value=db)
+        mock_fresh.return_value.__exit__ = MagicMock(return_value=False)
         call_next = AsyncMock()
         response = await middleware(mock_request, call_next)
         assert response.status_code == status.HTTP_403_FORBIDDEN
@@ -1165,3 +1071,72 @@ async def test_public_only_resource_denied():
         response = await middleware(mock_request, call_next)
         assert response.status_code == status.HTTP_403_FORBIDDEN
         call_next.assert_not_called()
+
+
+# --------------------------------------------------------------------------- #
+# Issue #2330: Verify fresh_db_session() used instead of next(get_db())        #
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_call_uses_fresh_db_session_for_team_scoped_tokens():
+    """__call__ must use fresh_db_session() context manager instead of next(get_db()) to prevent pool exhaustion."""
+    middleware = TokenScopingMiddleware()
+    mock_request = _make_request()
+
+    payload = {"sub": "user@example.com", "teams": ["team-1"], "scopes": {"permissions": ["*"]}}
+    db = MagicMock()
+
+    with (
+        patch.object(middleware, "_extract_token_scopes", return_value=payload),
+        patch.object(middleware, "_check_team_membership", return_value=True),
+        patch.object(middleware, "_check_resource_team_ownership", return_value=True),
+        patch.object(middleware, "_check_server_restriction", return_value=True),
+        patch.object(middleware, "_check_permission_restrictions", return_value=True),
+        patch("mcpgateway.db.fresh_db_session") as mock_fresh,
+    ):
+        mock_fresh.return_value.__enter__ = MagicMock(return_value=db)
+        mock_fresh.return_value.__exit__ = MagicMock(return_value=False)
+        call_next = AsyncMock(return_value="ok")
+        result = await middleware(mock_request, call_next)
+        assert result == "ok"
+        mock_fresh.assert_called_once()
+
+
+def test_check_team_membership_uses_fresh_db_session(monkeypatch):
+    """_check_team_membership must use fresh_db_session() when it owns the session."""
+    middleware = TokenScopingMiddleware()
+    payload = {"sub": "user@example.com", "teams": ["team-1"]}
+
+    cache = MagicMock()
+    cache.get_team_membership_valid_sync.return_value = None
+    monkeypatch.setattr("mcpgateway.cache.auth_cache.get_auth_cache", lambda: cache)
+
+    db = MagicMock()
+    result_proxy = MagicMock()
+    result_proxy.scalars.return_value.all.return_value = ["team-1"]
+    db.execute.return_value = result_proxy
+
+    with patch("mcpgateway.db.fresh_db_session") as mock_fresh:
+        mock_fresh.return_value.__enter__ = MagicMock(return_value=db)
+        mock_fresh.return_value.__exit__ = MagicMock(return_value=False)
+        result = middleware._check_team_membership(payload)
+        assert result is True
+        mock_fresh.assert_called_once()
+
+
+def test_check_resource_team_ownership_uses_fresh_db_session(monkeypatch):
+    """_check_resource_team_ownership must use fresh_db_session() when it owns the session."""
+    middleware = TokenScopingMiddleware()
+
+    db = MagicMock()
+    resource = MagicMock()
+    resource.visibility = "public"
+    db.execute.return_value.scalar_one_or_none.return_value = resource
+
+    with patch("mcpgateway.db.fresh_db_session") as mock_fresh:
+        mock_fresh.return_value.__enter__ = MagicMock(return_value=db)
+        mock_fresh.return_value.__exit__ = MagicMock(return_value=False)
+        result = middleware._check_resource_team_ownership("/resources/a1b2c3d4", ["team-1"], _user_email="user@example.com")
+        assert result is True
+        mock_fresh.assert_called_once()
